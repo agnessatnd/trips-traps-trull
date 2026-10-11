@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="et">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Tagab õige skaala mobiilseadmetes -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Trips-Traps-Trull</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        margin: 0;
+        padding: 15px;
+        text-align: center;
+        background-color: #f9f9f9;
+      }
+
+      /* Konteiner, mis paigutab kaamera ja canvase kõrvuti või kohakuti */
+      .game-container {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 10px;
+        max-width: 800px;
+        margin: 0 auto;
+      }
+
+      video,
+      canvas {
+        width: 100%;
+        max-width: 360px; /* Telefonis võtab täislaiuse, suuremal ekraanil piiratud */
+        height: auto;
+        border-radius: 8px;
+        background: #222;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+      }
+
+      .info-box {
+        margin-top: 15px;
+        padding: 10px;
+        background: white;
+        border-radius: 8px;
+        max-width: 500px;
+        margin-left: auto;
+        margin-right: auto;
+      }
+
+      button {
+        padding: 12px 24px;
+        font-size: 16px;
+        background-color: #007bff;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+
+      button:active {
+        background-color: #0056b3;
+      }
+
+      /* taseme valik */
+      label,
+      select {
+        font-size: 16px;
+      }
+
+      /* seaded ja liugurid */
+      details {
+        margin-top: 12px;
+        text-align: left;
+      }
+
+      details label {
+        display: block;
+        margin: 8px 0;
+      }
+
+      input[type="range"] {
+        width: 100%;
+      }
+
+      button.secondary {
+        background-color: #6c757d;
+        font-size: 15px;
+        padding: 10px 16px;
+        margin-top: 8px;
+      }
+
+      #s1 {
+        display: block;
+        font-size: 11px;
+        color: #666;
+        word-break: break-all;
+        margin-top: 10px;
+      }
+    </style>
+    <script>
+      const SCRIPT_URL =
+        "https://script.google.com/macros/s/AKfycbz2zzmHjPJ0KjAZI-US-z49iACIHqGy_1Zsw_VAybqs1RdobUkRRR3BitGH30rkhfwcZw/exec";
+
+      let player = null,
+        c = null,
+        g = null;
+      let span1 = null,
+        status = null;
+
+      // Sisemine resolutsioon arvutusteks
+      const CANVAS_WIDTH = 320;
+      const CANVAS_HEIGHT = 240;
+
+      // laua asukoht canvasel (muudetav liugurite abil, salvestatakse brauserisse)
+      let X0 = 55,
+        Y0 = 15,
+        CELL = 70;
+
+      const MOTION_LIMIT = 20; // kaadrite vahe, millest suurema korral midagi liigub
+      const RED_MARGIN = 45; // kui palju peab ruut olema tühja laua punasusest punasem
+      let baseline = null; // tühja laua punasus iga ruudu kohta
+      let calibrateNext = false;
+      let prevAvg = null;
+
+      let board = ["_", "_", "_", "_", "_", "_", "_", "_", "_"];
+      let lastKey = "";
+      let holdCounter = 0;
+      let busy = false;
+      let warned = false; // kas ekraanil on hoiatus, mis tuleb hiljem ära võtta
+      let gameOver = false;
+      let gameId = "g" + Date.now();
+      let totalNodes = 0; // kokku läbi vaadatud seisud selles mängus
+      let totalMs = 0; // kokku serveri arvutusaeg selles mängus
+
+      function start() {
+        player = document.getElementById("v1");
+        c = document.getElementById("c1");
+        g = c.getContext("2d", { willReadFrequently: true });
+        span1 = document.getElementById("s1");
+        status = document.getElementById("status");
+
+        loadSettings();
+
+        navigator.mediaDevices
+          .getUserMedia({ video: { facingMode: "environment" } })
+          .then((stream) => {
+            player.srcObject = stream;
+          })
+          .catch((err) => {
+            console.error("Kaamera viga:", err);
+            status.innerText = "Kaamerat ei saanud käivitada.";
+          });
+
+        keepAwake(); // ekraan ei lähe magama
+
+        setInterval(capture, 500);
+      }
+
+      // ---------- seaded (salvestatakse brauserisse) ----------
+
+      function loadSettings() {
+        try {
+          const s = JSON.parse(localStorage.getItem("ttt-settings") || "{}");
+          if (s.CELL) {
+            X0 = s.X0;
+            Y0 = s.Y0;
+            CELL = s.CELL;
+          }
+          if (s.baseline && s.baseline.length === 9) baseline = s.baseline;
+        } catch (e) {}
+        document.getElementById("sx").value = X0;
+        document.getElementById("sy").value = Y0;
+        document.getElementById("ssize").value = CELL;
+      }
+
+      function saveSettings() {
+        try {
+          localStorage.setItem(
+            "ttt-settings",
+            JSON.stringify({ X0: X0, Y0: Y0, CELL: CELL, baseline: baseline }),
+          );
+        } catch (e) {}
+      }
+
+      function onGridChange() {
+        CELL = +document.getElementById("ssize").value;
+        X0 = Math.min(
+          +document.getElementById("sx").value,
+          CANVAS_WIDTH - 3 * CELL,
+        );
+        Y0 = Math.min(
+          +document.getElementById("sy").value,
+          CANVAS_HEIGHT - 3 * CELL,
+        );
+        document.getElementById("sx").value = X0;
+        document.getElementById("sy").value = Y0;
+        baseline = null; // asukoht muutus, vana kalibreerimine ei kehti
+        saveSettings();
+      }
+
+      function calibrate() {
+        calibrateNext = true;
+        status.innerText =
+          "Kalibreerin... tühjenda laud ja hoia käsi kaamerast eemal.";
+      }
+
+      function keepAwake() {
+        try {
+          if ("wakeLock" in navigator)
+            navigator.wakeLock.request("screen").catch(() => {});
+        } catch (e) {}
+      }
+
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") keepAwake();
+      });
+
+      // ---------- Kaamera ja värvide tuvastus ----------
+
+      function capture() {
+        if (!player.videoWidth) return;
+
+        // lõikame kaadri 4:3 formaati, et ruudud ei veniks (nt 16:9 kaamera korral)
+        const vw = player.videoWidth,
+          vh = player.videoHeight;
+        let sw = vw,
+          sh = (vw * CANVAS_HEIGHT) / CANVAS_WIDTH;
+        if (sh > vh) {
+          sh = vh;
+          sw = (vh * CANVAS_WIDTH) / CANVAS_HEIGHT;
+        }
+        g.drawImage(
+          player,
+          (vw - sw) / 2,
+          (vh - sh) / 2,
+          sw,
+          sh,
+          0,
+          0,
+          CANVAS_WIDTH,
+          CANVAS_HEIGHT,
+        );
+
+        let redCells = [];
+        let avgs = [];
+        let scores = [];
+        let rawRed = [];
+        let info = "";
+
+        const m = Math.round(CELL * 0.21); // ääreruum, et jooned ei segaks (CELL 70 puhul 15)
+        const size = CELL - 2 * m; // (CELL 70 puhul 40)
+
+        for (let i = 0; i < 9; i++) {
+          let cx = X0 + (i % 3) * CELL;
+          let cy = Y0 + Math.floor(i / 3) * CELL;
+          let d = g.getImageData(cx + m, cy + m, size, size);
+
+          let totalR = 0,
+            totalG = 0,
+            totalB = 0;
+          let pixels = d.data.length / 4;
+          for (let p = 0; p < d.data.length; p += 4) {
+            totalR += d.data[p];
+            totalG += d.data[p + 1];
+            totalB += d.data[p + 2];
+          }
+          let r = Math.round(totalR / pixels);
+          let gr = Math.round(totalG / pixels);
+          let b = Math.round(totalB / pixels);
+
+          avgs.push([r, gr, b]);
+          scores.push(r - (gr + b) / 2); // punasuse skoor
+
+          let ratioOk = r > gr * 1.5 && r > b * 1.5;
+          rawRed.push(r > 140 && ratioOk); // sinu vana reegel
+
+          // kui laud on kalibreeritud, võrdleme tühja lauaga, muidu kehtib vana reegel
+          let isRed;
+          if (baseline) isRed = ratioOk && scores[i] - baseline[i] > RED_MARGIN;
+          else isRed = rawRed[i];
+
+          if (isRed) redCells.push(i);
+          info += i + ":" + r + "," + gr + "," + b + " ";
+        }
+
+        // liikumine = kui palju pilt eelmisest kaadrist erineb
+        let motion = 0;
+        if (prevAvg) {
+          for (let i = 0; i < 9; i++) {
+            motion +=
+              Math.abs(avgs[i][0] - prevAvg[i][0]) +
+              Math.abs(avgs[i][1] - prevAvg[i][1]) +
+              Math.abs(avgs[i][2] - prevAvg[i][2]);
+          }
+          motion /= 9;
+        }
+        prevAvg = avgs;
+
+        // kalibreerimine (tühi laud, pilt paigal)
+        if (calibrateNext && motion < MOTION_LIMIT) {
+          if (rawRed.some((x) => x)) {
+            status.innerText =
+              "Laual on punane nupp. Tühjenda laud ja vajuta uuesti.";
+            calibrateNext = false;
+          } else {
+            baseline = scores.slice();
+            calibrateNext = false;
+            saveSettings();
+            status.innerText = "Kalibreeritud! Sinu käik!";
+          }
+        }
+
+        span1.innerHTML =
+          (baseline ? "kalibreeritud" : "kalibreerimata") +
+          " | liikumine:" +
+          Math.round(motion) +
+          " | " +
+          info;
+
+        drawOverlay(redCells);
+        detectMove(redCells, motion);
+      }
+
+      function drawOverlay(redCells) {
+        g.strokeStyle = "white";
+        g.lineWidth = 2;
+        g.strokeRect(X0, Y0, CELL * 3, CELL * 3);
+        for (let k = 1; k < 3; k++) {
+          g.beginPath();
+          g.moveTo(X0 + k * CELL, Y0);
+          g.lineTo(X0 + k * CELL, Y0 + CELL * 3);
+          g.moveTo(X0, Y0 + k * CELL);
+          g.lineTo(X0 + CELL * 3, Y0 + k * CELL);
+          g.stroke();
+        }
+
+        for (let i = 0; i < 9; i++) {
+          let cx = X0 + (i % 3) * CELL + CELL / 2;
+          let cy = Y0 + Math.floor(i / 3) * CELL + CELL / 2;
+          if (board[i] === "H") {
+            // salvestatud käik, jääb mängu lõpuni ka siis, kui nupp võetakse ära
+            g.strokeStyle = "red";
+            g.lineWidth = 5;
+            g.beginPath();
+            g.arc(cx, cy, 22, 0, Math.PI * 2);
+            g.stroke();
+          } else if (redCells.includes(i)) {
+            // nupp on nähtud, aga käik pole veel salvestatud
+            g.strokeStyle = "orange";
+            g.lineWidth = 2;
+            g.setLineDash([5, 4]);
+            g.beginPath();
+            g.arc(cx, cy, 22, 0, Math.PI * 2);
+            g.stroke();
+            g.setLineDash([]);
+          }
+          if (board[i] === "C") {
+            g.fillStyle = "blue";
+            g.beginPath();
+            g.arc(cx, cy, 14, 0, Math.PI * 2);
+            g.fill();
+          }
+        }
+      }
+
+      function detectMove(redCells, motion) {
+        if (busy || gameOver) return;
+
+        // kui midagi liigub (käsi, nupp), alustame ootamist otsast peale
+        if (motion > MOTION_LIMIT) {
+          lastKey = "";
+          holdCounter = 0;
+          return;
+        }
+
+        let key = redCells.join(",");
+        if (key === lastKey) holdCounter++;
+        else {
+          lastKey = key;
+          holdCounter = 0;
+        }
+        if (holdCounter !== 3) return;
+
+        // sinu varasemad käigud (H) on mälus, nupp ei pea enam laual olema.
+        // Uueks käiguks loeme ainult punast nuppu ruudus, mis oli veel tühi.
+        let added = redCells.filter((i) => board[i] === "_");
+        let onComputer = redCells.filter((i) => board[i] === "C");
+
+        if (onComputer.length > 0) {
+          status.innerText =
+            "Ruut " + (onComputer[0] + 1) + " on arvuti oma. Vali teine ruut.";
+          warned = true;
+          return;
+        }
+        if (added.length > 1) {
+          status.innerText =
+            "Laual on korraga mitu uut nuppu. Jäta ainult üks uus.";
+          warned = true;
+          return;
+        }
+        if (added.length === 0) {
+          if (warned) {
+            warned = false;
+            status.innerText = "Sinu käik!";
+          }
+          return;
+        }
+
+        warned = false;
+        let newCell = added[0];
+        board[newCell] = "H"; // käik salvestatud mängu lõpuni
+        askComputer();
+        status.innerText =
+          "Käik ruutu " +
+          (newCell + 1) +
+          " salvestatud, nupu võid ära võtta. Arvuti mõtleb...";
+      }
+
+      function askComputer() {
+        busy = true;
+        status.innerText = "Arvuti mõtleb...";
+        const t0 = Date.now(); // mõõdame kogu vastuse aega
+        const myGame = gameId; // et vana vastus ei läheks uude mängu
+
+        fetch(SCRIPT_URL, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain" },
+          // saadame ka valitud taseme
+          body: JSON.stringify({
+            gameId: gameId,
+            board: board,
+            level: document.getElementById("level").value,
+          }),
+        })
+          .then((r) => r.json())
+          .then((data) => {
+            if (myGame !== gameId) return; // UUS
+            if (data.move >= 0) board[data.move] = "C";
+            showThinking(data, Date.now() - t0); // UUS
+            if (data.winner === "H") {
+              status.innerText = "Sina võitsid!";
+              gameOver = true;
+            } else if (data.winner === "C") {
+              status.innerText = "Arvuti võitis!";
+              gameOver = true;
+            } else if (data.winner === "D") {
+              status.innerText = "Viik!";
+              gameOver = true;
+            } else
+              status.innerText =
+                "Arvuti käis ruutu " +
+                (data.move + 1) +
+                " (sinine täpp). Sinu käik!";
+            busy = false;
+          })
+          .catch((err) => {
+            console.error(err);
+            if (myGame !== gameId) return;
+            // sinu käik on mälus, nupp võib olla juba ära võetud, seega proovime sama käiku uuesti
+            status.innerText = "Serveri viga. Proovin varsti uuesti...";
+            setTimeout(() => {
+              if (myGame === gameId && !gameOver) askComputer();
+            }, 3000);
+          });
+      }
+
+      // näitab, kui palju arvuti arvutas
+      function showThinking(data, roundTrip) {
+        const fmt = (n) => Number(n).toLocaleString("et-EE");
+        let text = "";
+        if (data.nodes === undefined) return; // vana server ei saada arvutusinfot
+        totalNodes += data.nodes;
+        totalMs += data.ms || 0;
+        if (data.nodes > 0) {
+          text =
+            "Arvuti vaatas läbi " +
+            fmt(data.nodes) +
+            " võimalikku seisu, kuni " +
+            data.depth +
+            " käiku ette (mängu lõpuni). Serveri arvutus " +
+            data.ms +
+            " ms, kogu vastus " +
+            roundTrip +
+            " ms. ";
+        } else if (data.move >= 0) {
+          text =
+            "Arvuti valis selle käigu juhuslikult (tase: " +
+            data.level +
+            "). Vastus " +
+            roundTrip +
+            " ms. ";
+        }
+        text +=
+          "Kokku selles mängus: " +
+          fmt(totalNodes) +
+          " seisu, " +
+          totalMs +
+          " ms.";
+        document.getElementById("think").innerText = text;
+      }
+
+      function reset() {
+        totalNodes = 0;
+        totalMs = 0;
+        document.getElementById("think").innerText = "";
+        board = ["_", "_", "_", "_", "_", "_", "_", "_", "_"];
+        gameOver = false;
+        busy = false; // UUS
+        warned = false; // UUS
+        lastKey = "";
+        holdCounter = 0;
+        gameId = "g" + Date.now();
+        status.innerText = "Uus mäng. Tühjenda laud. Sinu käik!";
+      }
+    </script>
+  </head>
+  <body onload="start()">
+    <h2>Trips-Traps-Trull</h2>
+
+    <div class="game-container">
+      <video id="v1" autoplay playsinline muted></video>
+      <canvas id="c1" width="320" height="240"></canvas>
+    </div>
+
+    <div class="info-box">
+      <p><b id="status">Sinu käik!</b></p>
+      <p id="think" style="font-size: 13px; color: #444"></p>
+
+      <!-- taseme valik -->
+      <p>
+        <label>
+          Tase
+          <select id="level">
+            <option value="easy">Lihtne</option>
+            <option value="medium" selected>Keskmine</option>
+            <option value="hard">Raske</option>
+          </select>
+        </label>
+      </p>
+
+      <button onclick="reset()">Uus mäng</button>
+
+      <!-- laua asukoht ja kalibreerimine -->
+      <details>
+        <summary>Seaded: laua asukoht ja kalibreerimine</summary>
+        <label
+          >Vasak / parem
+          <input
+            type="range"
+            id="sx"
+            min="0"
+            max="250"
+            value="55"
+            oninput="onGridChange()"
+        /></label>
+        <label
+          >Üles / alla
+          <input
+            type="range"
+            id="sy"
+            min="0"
+            max="170"
+            value="15"
+            oninput="onGridChange()"
+        /></label>
+        <label
+          >Suurus
+          <input
+            type="range"
+            id="ssize"
+            min="40"
+            max="78"
+            value="70"
+            oninput="onGridChange()"
+        /></label>
+        <button class="secondary" onclick="calibrate()">
+          Kalibreeri tühi laud
+        </button>
+      </details>
+
+      <p>
+        <strong>Juhend:</strong><br />
+        Sea joonistatud laud kaamera ees valge ruudustiku sisse.<br />
+        Sina käid PUNASTE paberitükkidega, arvuti joonistab SINISE täpi.<br />
+        Kui ruudu ümber on paks punane ring, on käik salvestatud ja nupu võid
+        ära võtta.
+      </p>
+
+      <span id="s1"></span>
+    </div>
+  </body>
+</html>
